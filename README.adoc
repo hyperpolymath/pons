@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+= pons
+:toc: preamble
+
+*pons* — after the _pons asinorum_ (Euclid I.5, the "bridge of asses"), the
+historical test that separates real understanding from rote. A lightweight,
+multi-language static scanner that flags the small set of mistakes
+mathematicians and computing experts spot on sight but ordinary coders miss —
+*dead work*, *self-contradiction*, and *missing escape hatches* — and reports
+each finding with an honest label for how strong the evidence is.
+
+Design companion to
+https://github.com/hyperpolymath/panic-attack[panic-attack]: panic-attack is
+breadth (49 languages, security/panic weak points, line-level patterns +
+relational reasoning); pons is depth (a few languages, parse trees + real
+dataflow + typestate, waste/contradiction smells). See
+link:docs/adr/0004-companion-to-panic-attack.adoc[ADR-0004].
+
+== Status
+
+*Planning complete; implementation not started.* This repository currently
+contains the ratified v0.1.0 plan, written so that implementation agents can
+execute it without re-opening any design question.
+
+Read in this order:
+
+. link:docs/pons-kickoff.adoc[The kickoff document] — mission, the two
+  species, the decidability wall, the four evidence tiers, the starter
+  catalogue.
+. link:docs/adr/0001-substrate.adoc[ADR-0001] — substrate decision
+  (tree-sitter native + Rust). *Decided; do not re-spike.*
+. link:docs/adr/0002-t1-language-and-cfg.adoc[ADR-0002] — T1 language
+  (Python) and the complete CFG + dataflow design.
+. link:docs/adr/0003-protocol-spec-and-typestate.adoc[ADR-0003] — T2
+  protocol spec format (TOML) and typestate semantics.
+. link:docs/adr/0004-companion-to-panic-attack.adoc[ADR-0004] — positioning
+  relative to panic-attack.
+. link:docs/PLAN.adoc[*PLAN.adoc*] — the milestone-by-milestone
+  implementation plan with acceptance gates and appendices (dataflow
+  equations, query guidance, JSON schema, SARIF mapping, dependency pins).
+
+== The one-line contract
+
+*Never dress a heuristic up as a proof.* Every finding carries an evidence
+class (`HEURISTIC` / `DATAFLOW` / `PROTOCOL` / `SPECULATIVE`), and
+`SPECULATIVE` findings are visually demoted in every output format. Every
+rule ships with a negative corpus that falsifies it; a rule that fires on its
+own negative corpus is demoted or removed, enforced in CI.
+
+== Author
+
+Jonathan D.A. Jewell.
+
+== Licence
+
+Dual, by artefact type (ratified 2026-07-08):
+
+* *Source code* — `MPL-2.0` (`LICENSE`, `LICENSES/MPL-2.0.txt`).
+* *Documentation, prose, and the wiki* — `CC-BY-SA-4.0`
+  (`docs/LICENSE`, `LICENSES/CC-BY-SA-4.0.txt`).
+
+Every file carries an SPDX header declaring which of the two applies.

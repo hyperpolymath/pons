@@ -1,0 +1,414 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Received verbatim from the project owner, 2026-07-07. This is the founding
+// document. The ADRs in docs/adr/ resolve the decisions it leaves open
+// (Task 0 substrate, T1 language choice, T2 protocol spec format).
+= pons — v0.1.0 Kickoff (Claude Code)
+:toc: left
+:toclevels: 3
+:sectnums:
+:icons: font
+:source-highlighter: rouge
+
+// Working name: `pons`, after the pons asinorum (Euclid I.5, the "bridge of
+// asses") — the historical test that separates real understanding from rote.
+// A tool that flags the mistakes experts spot and rote coders miss. Override
+// the name if you prefer; nothing below depends on it.
+
+== Mission
+
+Build a lightweight, multi-language static scanner that flags the small set of
+mistakes that mathematicians and computing experts spot on sight but ordinary
+coders miss — dead work, self-contradiction, and missing escape hatches — and
+reports each finding *with an honest label for how strong the evidence is*.
+
+The intellectual content of this project is the *catalogue* and the *epistemic
+honesty*, not a novel algorithm. We are not solving the halting problem. We are
+collecting expert-spotted smells that no single tool gathers in one place,
+delivering them across languages from one engine, and — critically — never
+dressing a heuristic up as a proof.
+
+== The two species (why the catalogue is shaped the way it is)
+
+Almost every target reduces to one of two shapes. Keep this in mind when adding
+rules; a rule that fits neither is probably out of scope.
+
+* *Wasted work* — the program computes something it then discards. Dead stores,
+  a loop entered and exited whose result is never read, a value stored that is
+  never used, accidental super-linear cost. "Labour for nothing."
+* *Contradiction* — the program asserts two incompatible things at once. Divide
+  by zero (asserts `a/0` is defined). Suppress-output-then-prompt (asserts both
+  "stay silent" and "speak"). An empty-effect loop (asserts "this iteration
+  matters" while producing nothing).
+
+A third, smaller shape is a *missing escape hatch* — e.g. a long operation with
+no way to interrupt it. Not waste, not contradiction, but a real defect.
+
+== The decidability wall (read before promising anything)
+
+The checks that sound most impressive are the least decidable, and v0.1.0 must
+respect that from day one:
+
+* *Real asymptotic complexity* is undecidable in general (Rice's theorem — it is
+  a non-trivial semantic property). Only ever a heuristic with a confidence,
+  never a verdict.
+* *General divide-by-zero* reduces to reachability plus the runtime value of the
+  divisor. Undecidable in general. Only the *literal-zero* case is cheap and
+  near-certain.
+* *Non-termination* — likewise.
+
+Conversely, the checks we *can* prove (unreachable code after `return`, a store
+dead on every path) are exactly what ordinary linters already do — just
+inconsistently and per-language. So our edge is not a check nobody has thought
+of; it is the *curated cross-language catalogue with honest labelling*.
+
+*Design consequence:* every finding carries an evidence class (below). We never
+emit a Tier-3 heuristic with the same visual authority as a Tier-1 dataflow
+result.
+
+== The four tiers
+
+Each rule declares exactly one tier. The tier fixes the default evidence class.
+
+[cols="1,3,2,2", options="header"]
+|===
+| Tier | What it rests on | Decidable? | Default evidence class
+
+| *T0 — Syntactic / structural*
+| Concrete syntax only (tree-sitter queries + small local predicates). No
+  control flow, no types.
+| Cheap, language-parametric, context-blind
+| `HEURISTIC`
+
+| *T1 — Intraprocedural dataflow*
+| A per-function control-flow graph + live-variable / reaching-defs analysis.
+| Decidable, sound *modulo* reflection / FFI / macros
+| `DATAFLOW`
+
+| *T2 — Typestate / protocol*
+| A supplied protocol over an abstract channel or resource (open/close,
+  lock/unlock, quiet/emit). Contract violation on a reachable path.
+| Decidable *given a correct protocol spec*
+| `PROTOCOL`
+
+| *T3 — Undecidable / heuristic*
+| Pattern catalogue only (real complexity, general div-by-zero, non-termination,
+  missing interrupt).
+| Undecidable — smell, not verdict
+| `SPECULATIVE` (explicitly lossy)
+|===
+
+*Lossy labelling (recoverability):* `SPECULATIVE` findings are marked
+non-authoritative in every output format. A pattern match cannot be recovered
+into certainty, and the report must not pretend otherwise. Treat this as a hard
+requirement, not a nicety.
+
+== v0.1.0 scope
+
+=== In scope (the definition of done)
+
+. Engine that loads a directory, dispatches per file by language, parses with
+  tree-sitter, runs rules, and emits findings.
+. The *finding model* (below) with evidence class, tier, location span, a
+  one-line evidence string, and an optional counter-condition note.
+. Three output formats: human (default), JSON, and SARIF 2.1.0.
+. *T0 catalogue* working across *Python, JavaScript/TypeScript, and Rust*.
+. *At least two T1 rules* working on *one* language (Rust or Python — pick the
+  one whose tree-sitter CFG you can stand up fastest) to prove the dataflow path
+  is real.
+. *One T2 protocol demo* end-to-end against a supplied toy protocol, to prove
+  the typestate path is real and to make the "suppress-then-prompt" flagship
+  concrete.
+. *T3 rules* present but visibly labelled `SPECULATIVE`.
+. Suppression: inline comment (`// pons:allow <rule-id>` / `# pons:allow ...`)
+  and a repo-level config file.
+
+=== Out of scope for v0.1.0 (bound the work)
+
+* Interprocedural dataflow.
+* Build-system integration or compilation (must scan arbitrary source, lightly).
+* Real complexity bounds (no RAML / automatic amortised analysis — that is
+  language-specific and the opposite of lightweight).
+* Auto-fix / rewriting.
+* Competing with Semgrep on its own ground — see Task 0.
+
+== Task 0 — substrate spike (do this before writing the engine)
+
+Spend a short, time-boxed spike deciding the substrate. Do *not* skip this.
+
+* *tree-sitter native* (recommended default): grammars for nearly every
+  language, fast, embeddable, S-expression query language. Gets T0 across all
+  languages almost free. Gives no control flow, so T1 needs a small per-language
+  CFG extractor on top — acceptable because T1 is opt-in for one language in
+  v0.1.0.
+* *Semgrep as substrate*: pattern-rules-plus-dataflow-lite across many
+  languages. Possibly 80% of the T0/T1 substrate, which would make our work a
+  *ruleset* rather than a parser. Evaluate honestly whether building the
+  catalogue on Semgrep beats building an engine.
+* *CodeQL*: real interprocedural dataflow, but needs a build and a database —
+  fails "scan anything, lightly". Rejected for v0.1.0; note for later.
+
+Deliverable of Task 0: a one-paragraph decision record (`docs/adr/0001-substrate.adoc`)
+stating the choice and why. The rest of this document assumes *tree-sitter
+native + Rust*; if the spike says otherwise, adjust and record it.
+
+== Architecture (tree-sitter native + Rust)
+
+Cargo workspace, four crates:
+
+[source,text]
+----
+pons/
+  Cargo.toml                # workspace
+  crates/
+    pons-core/              # engine: no rules live here
+      src/
+        source.rs           # file discovery, language detection by extension
+        lang.rs             # Language registry; tree-sitter grammar handles
+        parse.rs            # source -> tree-sitter Tree
+        cfg/                # per-language CFG builder (trait + one impl in v0.1.0)
+          mod.rs            # Cfg, BasicBlock, trait CfgBuilder
+        dataflow.rs         # live-variable / reaching-defs over a Cfg
+        finding.rs          # Finding, EvidenceClass, Tier, Location, Severity
+        engine.rs           # orchestration: parse -> run rules -> collect
+        suppress.rs         # inline-comment + config suppression
+        report/
+          human.rs
+          json.rs
+          sarif.rs
+    pons-rules/             # THE CATALOGUE
+      src/
+        registry.rs         # Rule trait; inventory of all rules
+        t0/                 # syntactic rules (tree-sitter queries + predicates)
+        t1/                 # dataflow rules (consume Cfg + dataflow)
+        t2/                 # protocol/typestate checkers
+        t3/                 # heuristic rules (labelled SPECULATIVE)
+      rules/                # rule metadata + queries as data files (see schema)
+    pons-cli/               # `pons scan <path> [flags]`
+      src/main.rs
+    pons-protocols/         # toy + user-supplied protocol specs for T2
+  fixtures/                 # positive + NEGATIVE corpora per rule (see below)
+  docs/
+    adr/
+    catalogue.adoc          # generated: one entry per rule
+----
+
+=== The `Rule` trait (shape, not final code)
+
+[source,rust]
+----
+pub trait Rule {
+    fn id(&self) -> &'static str;          // e.g. "div-by-literal-zero"
+    fn tier(&self) -> Tier;
+    fn languages(&self) -> &'static [Lang]; // which grammars it applies to
+    fn check(&self, ctx: &RuleCtx) -> Vec<Finding>;
+}
+----
+
+`RuleCtx` exposes: the parsed `Tree`, the source text, the file's `Lang`, and —
+for T1/T2 rules — a lazily-built `Cfg` and dataflow facts. T0 rules touch only
+the tree.
+
+=== Finding model (the honesty lives here)
+
+[source,rust]
+----
+pub struct Finding {
+    pub rule_id:   String,
+    pub tier:      Tier,             // T0 | T1 | T2 | T3
+    pub evidence:  EvidenceClass,    // HEURISTIC | DATAFLOW | PROTOCOL | SPECULATIVE
+    pub severity:  Severity,         // INFO | WARN | ERROR (advisory only)
+    pub location:  Location,         // file + byte span + line/col span
+    pub message:   String,           // what is wrong, one line
+    pub evidence_note: String,       // WHY we think so — the "expert would say…"
+    pub counter_condition: Option<String>, // when this smell is actually fine
+}
+----
+
+Rules for output:
+
+* `SPECULATIVE` findings are visually demoted and carry a fixed suffix such as
+  "(heuristic — not a verdict)".
+* Every finding prints its `evidence_note`. A finding a human can't evaluate in
+  context is a finding they will switch off.
+* Where a sensible `counter_condition` exists, print it. This is what stops the
+  tool being deleted in week one.
+
+== Falsifier-first discipline (non-negotiable)
+
+This is the mechanism that keeps the false-positive rate survivable, and it is
+how we decide whether a rule earns its place.
+
+*Every rule ships with two fixture corpora:*
+
+* `fixtures/<rule-id>/positive/` — inputs where the smell is present and the
+  rule *must* fire.
+* `fixtures/<rule-id>/negative/` — inputs where the smell is present *in
+  syntax* but is actually correct, and the rule *must not* fire.
+
+The negative corpus *is* the rule's falsifier. A rule that fires anywhere in its
+own negative corpus is falsified: it gets demoted (e.g. T0→T3, `WARN`→`INFO`) or
+removed. Wire this into CI as a gate: *zero findings on negative corpora is a
+build-breaking requirement.*
+
+This mirrors how an expert reads code: they spot the smell *and* instantly know
+when it is fine. A tool that can't do the second half is noise.
+
+== Starter catalogue (~15 rules; argue before extending)
+
+Each entry: `id` — tier — what it matches — detection — counter-condition (the
+negative corpus seed) — falsifier. Every motivating example the project was born
+from is covered and mapped to the correct tier.
+
+=== T0 — syntactic / structural
+
+. *`div-by-literal-zero`* — T0. `/` or `%` whose RHS is a literal `0`/`0.0`.
+  Detection: tree-sitter query on the binary-expression node. Counter-condition:
+  sits in provably dead code (T0 can't see that → stays `HEURISTIC`, not
+  `ERROR`). Falsifier: a real program that intends `/0` — essentially none, so
+  this is high-confidence *for T0*. (General variable divisor → see T3.)
+
+. *`self-assignment`* — T0. `x = x` where both sides are the same lexeme and the
+  target has no side-effecting setter. Detection: query + identifier equality.
+  Counter-condition: property setters with effects (`obj.p = obj.p`), or a
+  language with volatile reads. Falsifier: any language where `x = x` has
+  meaningful effect.
+
+. *`constant-condition`* — T0. `if (true)`, `if (false)`, `while (false)`.
+  Detection: query for literal boolean in the condition slot. Counter-condition:
+  debug/feature-flag constants that are edited in place.
+
+. *`while-true-no-break`* — T0. `while (true)` / `loop` with no `break` /
+  `return` / `throw` reachable in the body. Detection: query for the loop, then
+  a structural scan of the body for exit statements. Counter-condition:
+  intentional daemon / event loop → therefore `WARN` + suppressible, never
+  `ERROR`. Falsifier: a genuinely-intended infinite loop flagged loudly.
+
+. *`empty-effect-loop`* — T0. A loop whose body is empty or only no-ops — "you
+  enter and exit it but it's never used". Detection: query for empty/no-op body.
+  Counter-condition: deliberate spin-wait on a volatile / side-effecting
+  condition.
+
+. *`unreachable-after-jump`* — T0. Statements textually after `return` / `throw`
+  / `break` / `continue` in the same block. Detection: structural. (Arguably
+  T1, but decidable structurally in most grammars.) Counter-condition:
+  labels / fallthrough constructs.
+
+. *`swallowed-error`* — T0. A `catch` / `except` whose body is empty or only
+  `pass`. Detection: query. Counter-condition: a documented, intentional
+  swallow (look for a comment or a re-raise elsewhere).
+
+. *`string-concat-in-loop`* — T0. Immutable-string `+=` / `+` accumulation
+  inside a loop (quadratic build). Detection: query for augmented string assign
+  under a loop node. Counter-condition: tiny bounded loops; languages with
+  mutable strings / ropes. (A complexity smell that happens to be syntactically
+  visible — hence T0, not T3.)
+
+=== T1 — intraprocedural dataflow (prove on one language)
+
+[start=9]
+. *`dead-store`* — T1. A local assigned a value that is never read on any path
+  before reassignment or scope end. Detection: live-variable analysis over the
+  Cfg. Counter-condition: the *store* is dead but the RHS has side effects (flag
+  the store, note the computation may matter); deliberate placeholder. Falsifier:
+  the variable is read via reflection / macro expansion the analysis can't see —
+  hence conservative and per-language.
+
+. *`read-before-init`* — T1. A path on which a local is read before any
+  assignment. Detection: reaching-definitions over the Cfg. Counter-condition:
+  languages with defined default-initialisation semantics.
+
+=== T2 — typestate / protocol (one taught protocol, honestly limited)
+
+[start=11]
+. *`suppress-then-emit`* — T2. *The flagship.* Given a protocol declaring that a
+  call transitions channel `C` into a suppressed state and another call emits to
+  `C`: flag an emit on a path reachable *after* suppression with no intervening
+  un-suppress. Detection: typestate walk over the Cfg against the protocol spec.
+  Ship *one* toy protocol in `pons-protocols` (e.g. `set_quiet()` suppresses,
+  `prompt()` emits) to demonstrate end-to-end. *Document loudly* that real
+  protocols must be supplied — we detect the contradiction, we do not guess the
+  contract. This is the "logician spots it" case, shipped honest-as-limited.
+
+. *`resource-acquired-not-released`* — T2. Same shape (open/close, lock/unlock)
+  generalised. Detection: identical typestate machinery, different protocol.
+  Optional for v0.1.0; include if the typestate engine lands with time to spare.
+
+=== T3 — undecidable / heuristic (labelled `SPECULATIVE`)
+
+[start=13]
+. *`possible-superlinear`* — T3. Nested loops of depth ≥ 2 over the *same*
+  collection, or depth ≥ 3 over data-dependent bounds — "runs in double
+  quadratic time at some point". Detection: structural loop-nesting scan.
+  Counter-condition: intended pairwise work is *often correct* → always `INFO`,
+  never a verdict. Explicitly `SPECULATIVE`.
+
+. *`no-interrupt-on-long-op`* — T3. A loop with a data-dependent / unbounded
+  bound and no cancellation check inside (no break-on-flag, no timeout, no
+  cooperative yield / `await` point) — "no way of interrupting a very long
+  operation". Detection: heuristic over loop bound + body. Counter-condition:
+  bounded loops; loops doing I/O with inherent timeouts. `SPECULATIVE`.
+
+. *`general-div-by-zero`* — T3. `/` or `%` by a *variable* that the analysis
+  cannot prove non-zero. Detection: flag divisor expressions lacking a dominating
+  non-zero guard. Counter-condition: an upstream guard the local analysis can't
+  see. `SPECULATIVE` — the honest sibling of rule 1.
+
+== CLI surface (v0.1.0)
+
+[source,text]
+----
+pons scan <path>
+  --lang <py|js|ts|rust|...>   restrict languages (default: auto by extension)
+  --tier <0|1|2|3>             run up to and including this tier (default: all)
+  --min-evidence <heuristic|dataflow|protocol>   filter weak findings
+  --format <human|json|sarif>  (default: human)
+  --protocol <file>            supply a T2 protocol spec
+  --no-speculative             hide all T3/SPECULATIVE findings
+----
+
+Suppression precedence: inline `pons:allow` on the offending line > repo config
+(`pons.toml`) > defaults.
+
+== Acceptance criteria (the v0.1.0 gate)
+
+Tag `v0.1.0` only when *all* hold:
+
+* [ ] Scans a mixed directory (Python + JS/TS + Rust) and emits human, JSON, and
+  SARIF output.
+* [ ] Every T0 rule fires on *all* its positive fixtures and on *none* of its
+  negative fixtures. (CI gate.)
+* [ ] At least two T1 rules working on one language, with a real Cfg and
+  dataflow — passing their positive/negative corpora.
+* [ ] One T2 protocol demo (`suppress-then-emit`) working end-to-end against the
+  supplied toy protocol.
+* [ ] Every finding carries: `rule_id`, `tier`, `evidence`, `location` span, a
+  one-line `message`, and a non-empty `evidence_note`.
+* [ ] All T3 findings are visibly labelled non-authoritative in every format.
+* [ ] Suppression works via inline comment and `pons.toml`.
+* [ ] `docs/adr/0001-substrate.adoc` records the Task 0 decision.
+* [ ] `docs/catalogue.adoc` generated from the rule registry.
+
+== Suggested task order for Claude Code
+
+. Task 0 substrate spike + ADR.
+. `pons-core`: `finding.rs`, `source.rs`, `lang.rs`, `parse.rs`, human reporter.
+  Smoke test: parse a file, emit an empty report.
+. `pons-rules` T0: implement rules 1–8 as tree-sitter queries + predicates, each
+  with positive *and* negative fixtures. Wire the CI falsifier gate now — before
+  the catalogue grows.
+. JSON + SARIF reporters.
+. `pons-core/cfg` + `dataflow.rs` for one language; T1 rules 9–10.
+. `pons-protocols` + T2 rule 11 with the toy protocol.
+. T3 rules 13–15, plumb the `SPECULATIVE` labelling and `--no-speculative`.
+. Suppression, CLI polish, `docs/catalogue.adoc` generator.
+. Tag `v0.1.0`.
+
+== Guardrails / house style
+
+* GitHub is the single source of truth; mirror outward, do not develop on
+  mirrors.
+* UK English in all prose and docs. AsciiDoc, not Markdown, for docs.
+* Prefer Rust; avoid pulling in Python tooling for the engine itself.
+* Podman over Docker if any container work appears.
+* Do not let a rule ship without a negative corpus. The negative corpus is the
+  point.

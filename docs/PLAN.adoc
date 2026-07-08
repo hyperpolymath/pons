@@ -1,0 +1,352 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+= pons v0.1.0 — Implementation Plan
+:toc: left
+:toclevels: 3
+:sectnums:
+
+*Audience:* implementation agents (Opus + friends). Every genuine design
+question this project poses has been resolved in the kickoff + ADRs 0001–0004;
+what remains below is *execution*, not invention. If a milestone tempts you to
+re-open a decided question, stop and read the named ADR instead.
+
+*Reading order:* link:pons-kickoff.adoc[kickoff] → ADR-0001 (substrate) →
+ADR-0002 (T1 CFG/dataflow) → ADR-0003 (T2 typestate) → ADR-0004 (positioning) →
+this plan. The dataflow equations live in ADR-0002; the SARIF/JSON schemas and
+dependency pins live in this plan's appendices.
+
+== What has been bulldozed (so you don't have to)
+
+The three real intellectual walls in this project, and where each is resolved:
+
+. *"Engine or ruleset?"* (substrate) → *ADR-0001*: tree-sitter native + Rust.
+  Decided by analysis, not spike. One 30-minute smoke test remains in M0.
+. *"How do you do sound dataflow without a build, and on which language?"* →
+  *ADR-0002*: Python; full CFG construction table, both dataflow lattices with
+  transfer functions, the exception model, and the OPAQUE soundness hatch — all
+  written out. Transcribe, don't derive.
+. *"How do you detect a contradiction without guessing the contract?"* →
+  *ADR-0003*: user-supplied TOML protocol + typestate walk; the honesty is
+  structural (no protocol ⇒ no finding).
+
+Everything else (T0 rules, reporters, suppression, CLI) is ordinary engineering.
+
+== Milestones
+
+Each milestone has an *exit gate*. Do not start N+1 until N's gate is green.
+Milestones map to the kickoff's suggested task order.
+
+=== M0 — Workspace + substrate smoke test
+
+* Cargo workspace with the four crates (ADR-0001 architecture): `pons-core`,
+  `pons-rules`, `pons-cli`, `pons-protocols`. Add `pons-fixtures` test-support
+  as a dev-dependency helper if convenient.
+* Pin grammars per Appendix F. `build.rs` wiring so grammars compile in.
+* *Smoke test (the residual Task-0 validation):* parse one real file per pinned
+  grammar (Python, JavaScript, TypeScript, Rust) and run one trivial query
+  against each; assert non-empty parse + query match.
+* Repo hygiene: SPDX `MPL-2.0` header on every source file; `justfile` with
+  `build`, `test`, `falsify`, `catalogue`; UK-English `.editorconfig`; CI
+  skeleton (fmt + clippy + test).
+
+*Exit gate:* `cargo build` + the smoke test green on all four grammars. If a
+grammar won't load, fix the pin — do NOT reconsider ADR-0001.
+
+=== M1 — Core finding model + engine skeleton + human reporter
+
+* `finding.rs`: `Finding`, `Tier`, `EvidenceClass`, `Severity`, `Location`
+  (file + byte span + 1-based line/col span) exactly as the kickoff model. Add
+  `#[derive(Serialize)]` (serde) now — the JSON reporter needs it in M3.
+* `source.rs`: recursive file discovery; language detection by extension
+  (Appendix F table); skip `.git`, `target`, `node_modules`, and honour a
+  `.ponsignore` if present. (Mirror panic-attack's habit of skipping
+  `external_corpora/`, `third_party/`, `corpus/`.)
+* `lang.rs`: `Lang` enum + grammar-handle registry; TypeScript and TSX are
+  distinct `Lang`s sharing a rule set (ADR-0001).
+* `parse.rs`: source → tree-sitter `Tree`, with Latin-1 fallback for non-UTF-8
+  (panic-attack house behaviour).
+* `engine.rs`: orchestration — discover → parse → run applicable rules → collect
+  → sort (file, then byte offset) → report.
+* `report/human.rs`: the default reporter. *Must* implement the demotion rule:
+  `SPECULATIVE` findings are visually set apart and carry the fixed suffix
+  "(heuristic — not a verdict)"; every finding prints its `evidence_note`; print
+  `counter_condition` when present.
+* `RuleCtx` + `Rule` trait (kickoff shape) in `pons-core`; the *inventory* of
+  rules lives in `pons-rules::registry`.
+
+*Exit gate:* `pons scan <dir>` parses a mixed tree and prints an (empty)
+human report without panicking; a unit test constructs one `Finding` of each
+evidence class and asserts the human formatter demotes `SPECULATIVE`.
+
+=== M2 — T0 catalogue (rules 1–8) + the falsifier gate
+
+Implement rules 1–8 (kickoff catalogue) as tree-sitter queries + small local
+predicates in `pons-rules/src/t0/`, each across Python, JS/TS, and Rust where it
+applies. Query authoring guidance: Appendix D.
+
+*Build the falsifier gate FIRST, before rule 3* (Appendix C mechanics), so the
+catalogue grows under the gate from the start. Every rule ships
+`fixtures/<rule-id>/positive/**` and `fixtures/<rule-id>/negative/**` in the
+same commit as the rule.
+
+Per-rule counter-condition/severity notes are in the kickoff catalogue; obey
+them (e.g. `while-true-no-break` is `WARN`, never `ERROR`; `div-by-literal-zero`
+is `HEURISTIC`, never `ERROR`).
+
+*Exit gate (this is the kickoff CI gate):* for every T0 rule, *all* positive
+fixtures fire and *zero* negative fixtures fire. `just falsify` green in CI.
+
+=== M3 — JSON + SARIF reporters
+
+* `report/json.rs`: the envelope + finding schema in Appendix G. Stable field
+  order; counts by evidence class.
+* `report/sarif.rs`: SARIF 2.1.0 per Appendix E. *The evidence-class demotion
+  must survive into SARIF* — `SPECULATIVE` ⇒ `level:"note"` + low `rank` +
+  `properties.evidenceClass` + message suffix, so even a dumb SARIF viewer shows
+  the demotion.
+* `--format human|json|sarif` wired in the CLI.
+
+*Exit gate:* golden-file tests for JSON and SARIF on a fixed small corpus;
+a SARIF validator (Appendix E lists one) accepts the output; a `SPECULATIVE`
+finding is demoted in *all three* formats (asserted).
+
+=== M4 — Python CFG + dataflow + T1 rules 9–10
+
+Implement ADR-0002 verbatim:
+
+* `pons-core/cfg/` — `Cfg`, `BasicBlock`, `trait CfgBuilder`, and the Python
+  impl (the CFG-construction table). Include the CFG snapshot tests ADR-0002
+  mandates (for/else, try/except/finally, comprehension+walrus).
+* The OPAQUE hatch — *implement before the first T1 fixture.*
+* `dataflow.rs` — the backward live-variables and forward may-be-unbound
+  worklist solvers (ADR-0002 equations). Generic over the lattice so both reuse
+  one fixpoint engine.
+* `pons-rules/src/t1/` — rule 9 `dead-store`, rule 10 `read-before-init`, with
+  the counter-conditions and the specific positive/negative corpora ADR-0002
+  lists as test obligations.
+
+*Exit gate:* both T1 rules pass their positive/negative corpora; CFG snapshot
+tests green; a function containing `exec(` produces *zero* T1 findings (OPAQUE).
+
+=== M5 — T2 typestate + rule 11 (flagship) + toy protocol
+
+Implement ADR-0003:
+
+* `pons-protocols` — TOML protocol loader + the shipped `quiet-channel.toml`.
+* `pons-rules/src/t2/` — the typestate walk over the Python CFG; rule 11
+  `suppress-then-emit`; the path-witness capture for `evidence_note`.
+* `--protocol <file>` and the default-toy-protocol stderr note.
+* Rule 12 `resource-acquired-not-released` *only if time permits* (optional per
+  kickoff); its `must_exit_in` semantics are already specified.
+
+*Exit gate:* rule 11 fires on the positive corpus (incl. suppress-in-branch and
+suppress-in-loop) and stays silent on suppress→unsuppress→emit and on
+emit-on-different-key; every T2 finding names two concrete lines in its
+`evidence_note`.
+
+=== M6 — T3 rules 13–15 + SPECULATIVE plumbing
+
+* `pons-rules/src/t3/` — rule 13 `possible-superlinear`, rule 14
+  `no-interrupt-on-long-op`, rule 15 `general-div-by-zero`. All structural/
+  heuristic; all evidence class `SPECULATIVE`; all severity `INFO`.
+* `--no-speculative` and `--min-evidence` filters.
+* T3 rules get positive fixtures (must fire) but their "negative" corpora are
+  *disclosed-limitation* notes, not gated falsifiers where the design admits it
+  cannot decide — follow the ADR-0003 "limitation vs falsifier" distinction.
+
+*Exit gate:* `--no-speculative` removes exactly the T3 findings; every T3
+finding is demoted in human/JSON/SARIF; `--min-evidence dataflow` hides
+`HEURISTIC`+`SPECULATIVE`.
+
+=== M7 — Suppression + CLI polish + catalogue generator
+
+* `suppress.rs` — inline `# pons:allow <rule-id>` (Python) and
+  `// pons:allow <rule-id>` (JS/TS/Rust) on the offending line, plus repo-level
+  `pons.toml` (`[suppress]` by rule-id / path glob). Precedence: inline > config
+  > defaults (kickoff).
+* Full CLI surface (kickoff): `--lang`, `--tier`, `--min-evidence`, `--format`,
+  `--protocol`, `--no-speculative`.
+* `docs/catalogue.adoc` *generated from the rule registry* (a `just catalogue`
+  task that walks `registry` and emits one entry per rule: id, tier, evidence
+  class, languages, message template, counter-condition).
+
+*Exit gate:* a suppressed line produces no finding via both inline and config;
+`docs/catalogue.adoc` regenerates and matches the committed copy (drift test).
+
+=== M8 — Acceptance sweep + tag v0.1.0
+
+Walk the kickoff's acceptance-criteria checklist end to end on a purpose-built
+mixed fixture directory (Python + JS/TS + Rust). All boxes green ⇒ tag
+`v0.1.0`. Do not tag with any acceptance box unchecked.
+
+== Cross-cutting rules for every milestone
+
+* No rule merges without a negative corpus. The negative corpus is the point
+  (kickoff).
+* Zero compiler warnings (release + test), matching panic-attack policy.
+* UK English; AsciiDoc for docs; TOML for config; SPDX `MPL-2.0` header on every
+  file; `anyhow::Result` for errors; serde on public types.
+* GitHub is the single source of truth; arm every PR for auto-merge on open
+  (estate rule) *except* the initial owner-decisions issue and any
+  owner-ratification PR.
+
+'''
+
+== Appendix A — Rule → milestone → tier map
+
+[cols="1,3,1,1,2", options="header"]
+|===
+| # | id | tier | milestone | evidence
+| 1 | div-by-literal-zero | T0 | M2 | HEURISTIC
+| 2 | self-assignment | T0 | M2 | HEURISTIC
+| 3 | constant-condition | T0 | M2 | HEURISTIC
+| 4 | while-true-no-break | T0 | M2 | HEURISTIC
+| 5 | empty-effect-loop | T0 | M2 | HEURISTIC
+| 6 | unreachable-after-jump | T0 | M2 | HEURISTIC
+| 7 | swallowed-error | T0 | M2 | HEURISTIC
+| 8 | string-concat-in-loop | T0 | M2 | HEURISTIC
+| 9 | dead-store | T1 | M4 | DATAFLOW
+| 10 | read-before-init | T1 | M4 | DATAFLOW
+| 11 | suppress-then-emit | T2 | M5 | PROTOCOL
+| 12 | resource-acquired-not-released | T2 | M5 (opt) | PROTOCOL
+| 13 | possible-superlinear | T3 | M6 | SPECULATIVE
+| 14 | no-interrupt-on-long-op | T3 | M6 | SPECULATIVE
+| 15 | general-div-by-zero | T3 | M6 | SPECULATIVE
+|===
+
+== Appendix B — Evidence class ⇄ severity ⇄ default configuration
+
+* Evidence class is fixed by tier (T0→HEURISTIC, T1→DATAFLOW, T2→PROTOCOL,
+  T3→SPECULATIVE) and is *not* overridable per finding — it is the honesty
+  invariant.
+* Severity is advisory and per-rule (kickoff): no T0 rule exceeds `WARN`;
+  `div-by-literal-zero` and `while-true-no-break` are capped as the kickoff
+  states; all T3 are `INFO`.
+* A rule that fires on its own negative corpus is *demoted* (tier down and/or
+  severity down) or removed — never merged as-is (kickoff falsifier discipline).
+
+== Appendix C — The falsifier gate (CI mechanics)
+
+Implement as a single Rust integration test `tests/falsifier.rs` (plus a
+`just falsify` alias) that:
+
+. enumerates every registered rule id;
+. for each, globs `fixtures/<rule-id>/positive/**/*` and asserts the rule
+  produces *≥1* finding *of that rule id* in *each* positive file (an unflagged
+  positive file fails the build, naming the file);
+. globs `fixtures/<rule-id>/negative/**/*` and asserts *0* findings of that rule
+  id across all of them (any hit fails the build, naming file + line);
+. a rule with an empty or missing negative corpus *fails the gate* — the corpus
+  is mandatory.
+
+Wire into CI as a required check. This is the kickoff's "zero findings on
+negative corpora is build-breaking" made concrete. Keep it rule-scoped: a
+finding from a *different* rule in another rule's fixture is not a failure (so
+fixtures can be shared), only same-rule-id hits count.
+
+Fixture file naming: free-form; a leading `README.adoc` per rule folder
+explaining *why* each negative case is a legitimate non-finding (this doubles as
+catalogue source material and as the "expert knows when it's fine" record).
+
+== Appendix D — tree-sitter query authoring guidance (T0)
+
+* Store queries as `.scm` data files under `pons-rules/rules/<rule-id>/<lang>.scm`
+  where practical, loaded at startup; keep the Rust predicate (the "small local
+  predicate" a pure query can't express — e.g. identifier equality for
+  `self-assignment`) beside them. This matches the kickoff's "rules as data"
+  intent and lets the catalogue generator read metadata without running code.
+* Node-type names differ per grammar — e.g. Python `binary_operator`, JS
+  `binary_expression`, Rust `binary_expression`; Python `except_clause`, JS
+  `catch_clause`, Rust has no exceptions (rule 7 `swallowed-error` skips Rust,
+  but consider `let _ = result;`-style ignored `Result` as the Rust analogue —
+  *out of scope for v0.1.0, note only*). Encode the per-language node names in
+  each rule's `.scm`; the fixture corpus is your check that you got them right.
+* Prefer a query that over-captures + a Rust predicate that narrows, over a
+  clever all-in-one query — the predicate is testable in isolation.
+* `string-concat-in-loop` (rule 8) and `constant-condition` (rule 3): the loop-
+  ancestor / literal-boolean checks are structural; walk parents from the
+  captured node rather than encoding ancestry in the query.
+
+== Appendix E — SARIF 2.1.0 mapping (the demotion must survive)
+
+Per finding → one `result`:
+
+* `ruleId` = `rule_id`; `results[].ruleIndex` into `tool.driver.rules`.
+* `level`: T0/T1/T2 map `ERROR→"error"`, `WARN→"warning"`, `INFO→"note"`.
+  *T3/`SPECULATIVE` ⇒ always `"note"`* regardless of severity.
+* `rank`: HEURISTIC 50, DATAFLOW 80, PROTOCOL 70, SPECULATIVE 20 (low rank =
+  visually deprioritised in viewers that honour rank).
+* `message.text` = `message`; for `SPECULATIVE`, append " (heuristic — not a
+  verdict)".
+* `locations[].physicalLocation` = file URI + `region` (1-based line/col +
+  byte offsets).
+* `properties` (survives round-trip on every consumer): `evidenceClass`, `tier`,
+  `evidenceNote`, and `counterCondition` when present.
+* `tool.driver.rules[]` (reporting descriptors): `id`, `name`,
+  `shortDescription`, `defaultConfiguration.level`, and
+  `properties.tier`/`properties.evidenceClass`.
+
+Validate output against the SARIF 2.1.0 JSON schema (bundle the schema in
+`tests/` and validate with `jsonschema`), plus a smoke check with the Microsoft
+`sarif-tools`/`sarif validate` if available in CI. Golden-file the exact output
+for a fixed corpus.
+
+== Appendix F — Dependency + grammar pins
+
+Pin *exact* versions in the workspace `Cargo.toml`; a grammar bump is a
+deliberate, corpus-gated change (ADR-0001 consequence). Use the latest stable
+tree-sitter core compatible with all four grammars at implementation time;
+record the resolved versions here in M0 and treat this table as the source of
+truth thereafter.
+
+[cols="2,2,2", options="header"]
+|===
+| crate | purpose | pin (fill at M0)
+| `tree-sitter` | core parsing/query API | `=<resolved>`
+| `tree-sitter-python` | Python grammar (T0 + T1 + T2) | `=<resolved>`
+| `tree-sitter-javascript` | JS grammar (T0) | `=<resolved>`
+| `tree-sitter-typescript` | TS + TSX grammars (T0) | `=<resolved>`
+| `tree-sitter-rust` | Rust grammar (T0) | `=<resolved>`
+| `serde` / `serde_json` | JSON + SARIF serialisation | `=<resolved>`
+| `toml` | protocol + `pons.toml` parsing | `=<resolved>`
+| `clap` (derive) | CLI | `=<resolved>`
+| `anyhow` | error handling (house style) | `=<resolved>`
+| `ignore` / `walkdir` | file discovery + `.ponsignore` | `=<resolved>`
+|===
+
+Extension → `Lang` table (source.rs / lang.rs): `.py`→Python; `.js`/`.mjs`/
+`.cjs`→JavaScript; `.ts`→TypeScript; `.tsx`→TSX; `.jsx`→JavaScript (or TSX —
+decide at M1, document); `.rs`→Rust. Unknown extensions are skipped silently
+unless `--lang` forces one.
+
+== Appendix G — JSON report envelope
+
+[source,json]
+----
+{
+  "schema_version": "0.1.0",
+  "tool": { "name": "pons", "version": "<cargo pkg version>" },
+  "scanned": { "root": "<abs path>", "files": 123, "languages": ["python","rust"] },
+  "counts": { "by_evidence": { "HEURISTIC": 4, "DATAFLOW": 2,
+                               "PROTOCOL": 1, "SPECULATIVE": 3 },
+              "total": 10 },
+  "findings": [
+    {
+      "rule_id": "dead-store",
+      "tier": "T1",
+      "evidence": "DATAFLOW",
+      "severity": "WARN",
+      "location": { "file": "app/svc.py",
+                    "byte_start": 812, "byte_end": 819,
+                    "line_start": 41, "col_start": 5,
+                    "line_end": 41, "col_end": 12 },
+      "message": "value assigned to `total` is never read before it is overwritten",
+      "evidence_note": "live-variable analysis: `total` not in LiveOut after this store",
+      "counter_condition": null
+    }
+  ]
+}
+----
+
+Field order stable (golden-file tested). `counter_condition` is `null` when
+absent, never omitted. This envelope is compatible in shape with panic-attack's
+JSON habit (`schema_version` + typed arrays), easing the ADR-0004 records sink.

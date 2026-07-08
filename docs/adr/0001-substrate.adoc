@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+= ADR-0001: Substrate — tree-sitter native + Rust
+:status: ACCEPTED
+:date: 2026-07-07
+
+*Status:* ACCEPTED (Task 0 discharged by analysis; see "Residual smoke test"
+for the only implementation-time validation left). *Do not re-open this spike.*
+
+== Context
+
+The kickoff document (Task 0) requires a substrate decision before the engine
+is written: tree-sitter native, Semgrep-as-substrate, or CodeQL. The honest
+question is whether pons should be an *engine* or a *ruleset*.
+
+== Decision
+
+*tree-sitter native, Rust workspace.* Semgrep is rejected as substrate; CodeQL
+is rejected for v0.1.0 and noted as a possible optional deep backend post-v1.
+
+== Rationale
+
+The decision turns on four points, in decreasing order of weight:
+
+. *The evidence class must be structural, not conventional.* The entire
+  intellectual proposition of pons is that `SPECULATIVE` findings are
+  type-distinct from `DATAFLOW` findings and cannot be conflated. In our own
+  engine, `EvidenceClass` is a field the reporter is forced to handle in every
+  output path. As a Semgrep ruleset, evidence class would be a metadata
+  convention in YAML that nothing enforces — the one thing the project exists
+  to guarantee would be the one thing the substrate cannot guarantee.
+
+. *T2 typestate is not expressible in Semgrep.* Semgrep OSS offers pattern
+  matching plus constant propagation; taint mode (source→sink) is the closest
+  analogue and is not a state machine — it cannot express "emit reachable
+  after suppress with no intervening un-suppress" with per-path state sets.
+  The flagship rule (`suppress-then-emit`) therefore cannot be built on
+  Semgrep at all; we would need our own CFG + typestate walker regardless,
+  at which point Semgrep is only buying T0 — and tree-sitter queries buy the
+  same T0 without the runtime.
+
+. *T1 needs our CFG anyway.* `read-before-init` needs reaching definitions
+  and `dead-store` needs liveness; Semgrep's dataflow does not expose either
+  as a queryable fact. So under Semgrep the T1 path is also custom work
+  bolted onto someone else's AST, with no stable public AST API to bolt onto
+  (Semgrep's internal AST is not a supported extension surface).
+
+. *Deployment shape.* pons inherits panic-attack's "standalone" deployment
+  mode: a single static binary that scans arbitrary source, lightly, on an
+  air-gapped machine. Semgrep drags a Python/OCaml toolchain; tree-sitter
+  grammars compile into the binary as C via build.rs. Additionally, the
+  Semgrep engine is LGPL-2.1 and its rules registry carries a non-compete
+  licence; building *the catalogue* — our core asset — on that substrate
+  creates licence gravity we do not want. Tree-sitter and its grammars are
+  MIT.
+
+*What Semgrep would have bought:* T0 across ~30 languages immediately, and a
+mature pattern syntax. This is real, and the honest counter-argument. It is
+outweighed because v0.1.0 scopes T0 to three grammar families
+(Python, JS/TS, Rust), where tree-sitter queries are near-equivalent effort,
+and because points 1–3 mean the engine gets built either way.
+
+*CodeQL:* real interprocedural dataflow, but requires build integration and a
+database extraction step — it structurally fails "scan anything, lightly".
+Rejected for v0.1.0. Post-v1, a `--backend codeql` deep mode could upgrade
+selected T3 rules to evidence class `DATAFLOW`; noted, not planned.
+
+== Consequences
+
+* We own per-language CFG extraction. Bounded: exactly one language (Python,
+  per ADR-0002) in v0.1.0.
+* Grammar version pinning is a permanent maintenance cost. Mitigation: pin
+  exact grammar crate versions in the workspace (PLAN Appendix F) and treat
+  node-type names as part of the tested surface (the fixture corpora catch
+  grammar drift automatically — a grammar bump that renames node types breaks
+  positive fixtures, which is the desired failure mode).
+* `tree-sitter-typescript` ships *two* languages (`typescript`, `tsx`); the
+  registry must treat them as distinct grammars sharing one rule set.
+
+== Residual smoke test (implementation-time, ~30 minutes, not a spike)
+
+Milestone M0 includes one validation task: parse one non-trivial file with
+each pinned grammar (Python, JavaScript, TypeScript, Rust) and run one trivial
+query against each. If any pinned grammar fails to load or query under the
+pinned `tree-sitter` core crate, fix the pin table — do not re-open the
+substrate decision. Escalate to the owner only if tree-sitter itself proves
+unusable, which no current evidence suggests.

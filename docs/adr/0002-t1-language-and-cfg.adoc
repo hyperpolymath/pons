@@ -1,0 +1,295 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+= ADR-0002: T1 language = Python; CFG + dataflow design
+:status: ACCEPTED
+:date: 2026-07-07
+:toc: macro
+
+*Status:* ACCEPTED. This ADR fixes the T1 language *and* specifies the CFG and
+the two dataflow analyses concretely enough that implementation is
+transcription, not invention. The dataflow equations here ARE the design — do
+not re-derive them.
+
+toc::[]
+
+== Decision
+
+* *T1 language for v0.1.0 = Python* (not Rust).
+* *T1 rules = `dead-store` (rule 9) and `read-before-init` (rule 10).*
+* *CFG granularity = statement-level basic blocks, one function at a time
+  (intraprocedural).*
+* *Two analyses:* backward *live-variables* (feeds `dead-store`) and forward
+  *definite-assignment / may-be-unbound* (feeds `read-before-init`).
+* *Soundness stance:* conservative. When the analysis cannot see a fact, it
+  must not fire. An `OPAQUE` escape hatch disables T1 for functions containing
+  reflective locals access.
+
+== Why Python, not Rust (the honest trade)
+
+Both grammars are mature. The decision is about *false-positive surface*, which
+is the thing the falsifier-first discipline (kickoff) actually gates on.
+
+* *Rust is worse for these two rules, not better.*
+  ** `rustc` already emits `unused_variable` / `unused_assignment` warnings, so
+     `dead-store` on Rust largely re-implements an existing check — thin
+     value-add.
+  ** Rust `dead-store` has a nasty counter-condition: dropping a value runs
+     `Drop::drop`, which is a *side effect*. "Store never read" can still
+     matter. Distinguishing a dead store from a load-bearing drop needs type
+     resolution (does this type implement `Drop`?), which requires a build —
+     out of scope per ADR-0001. That pushes many honest Rust dead-stores into
+     the negative corpus and would force the rule down to T3.
+  ** Move semantics, shadowing (`let x = x;` is idiomatic and *not* a
+     self-assignment), and borrows further inflate the false-positive surface.
+
+* *Python is cleaner for exactly these two rules.*
+  ** *Function-level scope only* — Python has no block scope. Liveness and
+     definite-assignment lattices range over one flat set of function locals;
+     there are no nested lexical scopes to model within a function body. This
+     is a materially smaller CFG and lattice than Rust's block-scoped model.
+  ** *No defined default-initialisation* — reading a local before assignment is
+     a genuine runtime error (`UnboundLocalError`). So `read-before-init` has
+     *no* "default value" counter-condition in Python; it is the clean T1 rule
+     the kickoff wants to prove the dataflow path with.
+  ** The residual false-positive sources (reflection, comprehension/closure
+     scoping, `del`) are *enumerable and containable* — see the OPAQUE hatch and
+     the scope model below.
+
+The counter-argument (Rust is the house language) is real but does not touch
+correctness of these two analyses; it is answered by keeping the *engine* in
+Rust while the *analysed language* is Python. Rust as an analysed T1 language is
+a post-v1 milestone once a `Drop`-awareness story exists.
+
+== Scope model (Python name resolution, the part that bites)
+
+For each `function_definition` (and `lambda`, treated as a one-expression
+function) we compute the set `Locals`:
+
+* A *name* is `local` to a function iff it is *bound* anywhere in that
+  function's body — by assignment (`=`, augmented, walrus `:=`), `for`-target,
+  `with ... as`, `except ... as`, function/class def, or import — *and* it is
+  not declared `global` or `nonlocal` in that function.
+* Names declared `global`/`nonlocal`, and names never bound in the function
+  (free variables / builtins), are `non-local`: excluded from both analyses
+  (neither a def nor a kill; reads of them are ignored).
+* *Parameters* are `local` and *bound at entry*.
+* *Comprehension / generator scopes* (`[... for x in ...]`, dict/set/gen) are
+  their own nested functions in Python 3 — their targets do NOT leak. Recurse
+  into them as separate CFG units; do not let their targets enter the enclosing
+  `Locals`.
+* *Nested `def`/`lambda`*: analysed as separate units. From the enclosing
+  function's view a nested def only *reads* its free variables (a use), and
+  *binds* its own name (a def of the def's name). Do not descend into the
+  nested body when computing the enclosing function's def/use.
+
+== OPAQUE escape hatch (the soundness valve — implement first)
+
+Mark a function `OPAQUE` and *emit no T1 findings for it* if its body (excluding
+nested-def bodies) contains any of:
+
+* a call to `exec`, `eval`, `locals`, `globals`, or `vars`;
+* a wildcard import (`from m import *`) anywhere in the enclosing module;
+* `sys._getframe` / `inspect.currentframe` textual use.
+
+Rationale: each can read or write locals invisibly, defeating liveness and
+definite-assignment soundness. Firing OPAQUE is the mechanism that keeps the
+negative corpus green; a false positive traced to reflection is a *bug in the
+opacity check*, not a reason to weaken a rule. This check is a cheap tree scan
+and MUST exist before the first T1 fixture is written.
+
+== CFG construction (statement-level, per function)
+
+A `Cfg` is `{ entry: BlockId, exit: BlockId, blocks: Vec<BasicBlock>, edges }`.
+A `BasicBlock` holds an ordered list of *elementary statements* and its computed
+`(gen/kill)` sets. Build by structural recursion over the tree-sitter tree of
+the function body. Handle these node kinds; everything else is a linear
+statement appended to the current block:
+
+[cols="1,4", options="header"]
+|===
+| Construct | CFG shape
+
+| `if / elif / else`
+| Condition evaluated in the current block (it is a *use* site). Fork to
+  then-entry and else-entry (or to the join if no else). Both re-join at a fresh
+  merge block.
+
+| `while cond:`
+| Fresh *header* block holding `cond` (a use site). Header → body-entry (true)
+  and → after (false). Body tail → header (back-edge). `break` → after;
+  `continue` → header; `else:` clause entered on the false edge.
+
+| `for tgt in it:`
+| Fresh header. The iterable `it` is a use in the header. Header → body-entry on
+  the *iterate* edge, and → after on the *exhausted* edge. *`tgt` is defined on
+  the iterate edge only* — on the exhausted/never-entered edge it is NOT
+  (this is what makes "use of loop var after an empty-iterable loop" a genuine
+  read-before-init). Body tail → header. `break` → after; `continue` → header.
+
+| `try: … except E as e: … else: … finally: …`
+| See "Exception model" below — the single subtlety that matters for soundness.
+
+| `with cm as t:`
+| Linear. `cm` is a use; `t` is a def. Body is linear-appended. (The implicit
+  `__exit__` cannot rebind analysed locals.)
+
+| `match subj: case …:`
+| `subj` is a use in a header; one successor per `case` arm plus a fallthrough
+  edge if no arm is irrefutable. Capture patterns (`case [a, b]:`,
+  `case Point(x=px):`) *define* their captured names on that arm's edge.
+
+| `return` / `raise`
+| Terminates the block; edge to function `exit`. Statements textually after it
+  in the same suite are unreachable (this is where rule 6 `unreachable-after-jump`
+  reads the CFG, though rule 6 itself is T0/structural).
+
+| `break` / `continue`
+| Terminates the block; edge to the enclosing loop's after / header. Outside a
+  loop: ignore (syntactically invalid Python anyway).
+
+| `del x`
+| An *anti-definition* (kill of boundness) — see definite-assignment transfer.
+|===
+
+=== Exception model (coarse but sound — the one place to get right)
+
+A precise exceptional CFG (an edge from every possibly-raising expression to
+every handler) is unnecessary and explosive. Use this fixed approximation, which
+is *sound for both analyses*:
+
+* *For definite-assignment (read-before-init):* the predecessor of each
+  `except`/`finally` handler entry is the state *immediately before the `try`
+  body* — i.e. treat *nothing assigned inside the `try` body as guaranteed* when
+  a handler runs (any statement may have raised before completing). This is a
+  may-be-unbound over-approximation → sound (never under-reports unboundness,
+  hence never a false *negative* that matters; and it cannot manufacture a false
+  positive because it only *keeps* names maybe-unbound that genuinely might be).
+* *For liveness (dead-store):* each `except`/`finally` handler entry is a
+  *successor* of the `try` block. Therefore a variable stored in the `try` body
+  and read only inside a handler is correctly kept live → its store is not
+  reported dead. This prevents the most likely false positive.
+* `else:` runs only if the `try` body completed without raising: it is a normal
+  successor of the try-body tail (not of the handlers).
+* `finally:` is a successor of *both* the normal path and every handler; model
+  it as a join reached from the try-body tail and from each handler tail, then
+  its own tail flows to `after`.
+
+This model is stated once; the CFG builder implements exactly it. Do not
+"improve" it for v0.1.0 — a more precise model is a separate, gated change with
+its own negative corpus.
+
+== Def / use extraction per elementary statement
+
+Walking one statement yields ordered `uses` (names read) and `defs` (names
+bound), with *uses ordered before defs within the same statement*:
+
+[cols="1,3", options="header"]
+|===
+| Statement | uses / defs
+
+| `x = expr` | uses = names read in `expr`; defs = `{x}`.
+| `x, y = expr` (unpack) | uses = names in `expr`; defs = `{x, y}` (recurse into
+  nested targets `[a, (b, c)]`).
+| `x += expr` (augmented) | uses = `{x} ∪ names(expr)`; defs = `{x}`. (Augmented
+  assign *reads then writes* — critical for read-before-init.)
+| `x := expr` (walrus, inside any expr) | uses = names(expr); defs = `{x}`.
+| `x.attr = expr` / `x[i] = expr` | uses = `{x} ∪ names(i) ∪ names(expr)`;
+  defs = `{}`. (Assigning through an object is a *use* of the object, not a def
+  of the name.)
+| `del x` | kill = `{x}` (see transfer); not a normal def or use.
+| `for t in it:` (header) | uses = names(it); defs on iterate-edge = targets(t).
+| `with cm as t:` | uses = names(cm); defs = targets(t).
+| `except E as e:` | defs = `{e}` at handler entry (and Python *unbinds* `e` at
+  handler exit — model as a kill of `e` on the handler's exit edge).
+| bare call / expr statement `f(a)` | uses = names in the expression; defs = `{}`.
+|===
+
+== Analysis 1 — Live variables → `dead-store` (rule 9)
+
+Backward, may-analysis. Domain: subsets of `Locals`. Meet = union.
+Per block, precompute `use(B)` (names read before any def, walking forward) and
+`def(B)` (names bound in B).
+
+[source,text]
+----
+LiveOut(B) = ⋃ { LiveIn(S) : S ∈ succ(B) }
+LiveIn(B)  = use(B) ∪ ( LiveOut(B) \ def(B) )
+initialise all LiveIn = LiveOut = ∅ ; iterate to fixpoint (worklist)
+----
+
+*Firing condition.* For each assignment statement whose target is a name `x` at
+program point `p` (the point *after* the assignment within its block), `x` is a
+*dead store* iff `x ∉ LiveOut(p)` — no successor path reads `x` before it is
+redefined or the function ends. Report at the target's byte span.
+
+*Counter-conditions (negative-corpus seeds — apply in order):*
+
+. Target is `_` or begins with `_` → suppress (Python throwaway convention).
+. RHS *contains a call, `await`, `yield`, or walrus* → still report, but
+  `severity = INFO` and set `counter_condition` = "the binding is dead but its
+  right-hand side may have side effects worth keeping; drop the binding, not the
+  call." (The *store* is wasted work; the *computation* may not be.)
+. Otherwise `severity = WARN`.
+
+*Never `ERROR`* — a dead store is `WARN` at most (a program can be correct with
+one). Evidence class = `DATAFLOW`.
+
+== Analysis 2 — Definite assignment / may-be-unbound → `read-before-init` (rule 10)
+
+Forward, may-analysis. Domain: subsets of `Locals` = the set "possibly not yet
+bound on some path reaching here". Meet = union.
+
+[source,text]
+----
+Unbound_in(entry) = Locals \ Params
+Unbound_in(B)     = ⋃ { Unbound_out(P) : P ∈ pred(B) }        (union of preds)
+Unbound_out(B)    = apply transfers of B's statements, in order, to Unbound_in(B)
+
+transfer of a def of x        :  U := U \ {x}
+transfer of `del x`           :  U := U ∪ {x}
+transfer of a use of x        :  (no state change; emit check — see below)
+loop `for t in it:` exit edge :  t stays in U if it was in U before the loop
+                                 (loop may run zero times); iterate edge removes t
+except/finally handler entry  :  Unbound_in(handler) := Unbound_in(try-block)
+                                 (nothing in the try body is guaranteed bound)
+----
+
+*Firing condition.* At each *use* of a local name `x` occurring at a point where
+`x ∈ U` (the running may-unbound set just before the use), report: "on at least
+one path `x` is read before it is assigned — Python raises `UnboundLocalError`."
+Evidence class = `DATAFLOW`. Severity = `WARN` (it is a latent runtime crash,
+but only on some path). A use where `x ∈ U` on *every* path (i.e. `x` is unbound
+at entry to its enclosing region with no def before the use on any path) may be
+raised to `ERROR`; v0.1.0 keeps `WARN` uniformly to avoid a must-analysis.
+
+*Counter-conditions:* Python has essentially none for this rule (no default
+init). The only false-positive sources are (a) opacity — handled by the OPAQUE
+hatch; (b) scope confusion — handled by the scope model (a name that is actually
+`global`/`nonlocal`/free is not in `Locals` and is never checked). Augmented
+assignment `x += e` where `x ∈ U` is a *genuine* read-before-init (it reads `x`)
+and is correctly flagged — a deliberate positive-corpus case.
+
+== Widening / termination
+
+Both lattices are finite (powerset of a finite `Locals`), monotone transfers,
+union meet → a worklist iteration terminates without widening. No numeric
+domains, no widening operator needed. Cap `Locals` handling at, say, 4096 names
+per function (astronomically above real code) purely as a runaway guard; a
+function exceeding it is marked OPAQUE with a logged note.
+
+== Test obligations specific to T1 (beyond the shared falsifier gate)
+
+* A CFG *snapshot* test: for three hand-picked Python functions (one with a
+  `for/else`, one with `try/except/finally`, one with a comprehension + walrus),
+  assert the block/edge structure against a checked-in expected form. This is
+  the regression net for the exception and loop models above.
+* `dead-store` positive corpus MUST include: plain dead store; dead store whose
+  RHS is a call (asserts INFO + counter_condition, not suppression); redefinition
+  before use. Negative corpus MUST include: `_ = f()`; store read only inside an
+  `except` handler; store read only after the loop via the loop variable;
+  conditional use on one branch.
+* `read-before-init` positive corpus MUST include: use on the `else`-less `if`
+  fall-through path; use of a `for` target after a possibly-empty loop; `x += 1`
+  with no prior binding; use in a handler of a name assigned in the `try` body.
+  Negative corpus MUST include: a `global`-declared name; a name bound on every
+  predecessor path; a comprehension variable of the same name as an unbound
+  outer name.

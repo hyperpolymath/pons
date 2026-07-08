@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+= ADR-0004: pons as a design companion to panic-attack
+:status: ACCEPTED
+:date: 2026-07-07
+
+*Status:* ACCEPTED. Records why pons is a *separate* tool from panic-attack, and
+the one interop point they share.
+
+== Context
+
+panic-attack (this estate) is a mature static analyser: 49 languages, 25
+security/panic weak-point categories (PA001–PA025), a miniKanren relational
+engine, attestation chains, and estate integrations (verisimdb, hypatia, panll).
+pons overlaps in *genre* (static analysis of source) and could look like a
+feature request against panic-attack. This ADR says why it is not.
+
+== Decision
+
+*pons is a separate repository and binary.* It is the *depth-first* sibling to
+panic-attack's *breadth-first* posture. They share a *finding vocabulary* at the
+boundary and nothing else.
+
+== The axis that separates them
+
+[cols="1,3,3", options="header"]
+|===
+| | panic-attack | pons
+
+| Question
+| "Where might this crash or be exploited?"
+| "Where is this program doing wasted work or contradicting itself?"
+
+| Breadth vs depth
+| 49 languages, line/pattern + relational reasoning
+| 3–4 languages, real per-function CFG + dataflow + typestate
+
+| Evidence stance
+| Severity codes PA001–PA025
+| Four *evidence classes* with a hard rule that heuristics are never dressed as
+  proofs — the epistemic-honesty contract is the product
+
+| Core asset
+| The 25-category security catalogue + estate plumbing
+| The waste/contradiction catalogue + the falsifier-first negative corpora
+
+| Decidability posture
+| Pattern-matched weak points (mostly syntactic + taint)
+| Explicitly tiers findings by decidability (T0–T3); refuses to promise the
+  undecidable ones
+|===
+
+Folding pons into panic-attack would blur exactly the thing pons exists to make
+sharp: the evidence-class discipline. panic-attack's model is severity-coded;
+pons's model is evidence-classed. Keeping them separate keeps each honest.
+
+== The one interop point (deferred, not built in v0.1.0)
+
+pons emits SARIF 2.1.0 (see PLAN Appendix E). panic-attack's estate already
+consumes SARIF-shaped and JSON findings (RSR `static-analysis-gate.yml`,
+verisimdb hexads). Therefore the *only* planned coupling is: *pons findings,
+because they are SARIF, can flow into the same records sink panic-attack feeds*
+— pons's evidence class rides in `result.properties.evidenceClass`, and a
+consumer that wants to keep pons's `SPECULATIVE` findings visually demoted reads
+that property (or falls back to the demoted SARIF `level`/`rank`, per Appendix
+E). No shared library, no shared binary, no build-time dependency between the
+repos in v0.1.0.
+
+== Consequences
+
+* pons owns its own house style copied from panic-attack (SPDX `MPL-2.0` default,
+  UK English, AsciiDoc docs, TOML config, Podman-over-Docker) so an estate
+  contributor moving between the two feels no seam. Licence is owner-confirmable
+  (see owner-decisions issue).
+* pons does *not* import panic-attack's crates. If, post-v1, a shared
+  finding-model crate is worth extracting, that is its own ADR.
+* Naming: `pons` is a working name (kickoff). If the owner prefers a name that
+  signals the panic-attack sibling relationship, nothing in the code depends on
+  the string; see owner-decisions issue.

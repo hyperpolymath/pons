@@ -1,0 +1,176 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+= ADR-0003: T2 protocol spec format + typestate semantics
+:status: ACCEPTED
+:date: 2026-07-07
+:toc: macro
+
+*Status:* ACCEPTED. Fixes the protocol file format and the typestate-walk
+semantics for the flagship rule `suppress-then-emit` (rule 11) and its
+generalisation `resource-acquired-not-released` (rule 12). Reuses the Python
+CFG from ADR-0002 — T2 in v0.1.0 runs on Python only.
+
+toc::[]
+
+== The intellectual honesty at stake
+
+T2 is where the tool claims to catch "the contradiction a logician spots." The
+trap is pretending we *know* the contract. We do not. So the design law is:
+*pons detects a violation of a supplied contract; it never guesses the contract.*
+The protocol is data the user provides (one toy protocol ships to prove the
+path). A finding without a supplied protocol is impossible by construction —
+that is the honesty, made structural.
+
+== Decision — protocol spec format (TOML)
+
+A protocol is a TOML file (matching panic-attack / estate `pons.toml` house
+style — TOML for config, AsciiDoc for prose). It declares a finite-state machine
+over an *abstract channel*, with each transition keyed to a *syntactic call
+signature* the walker can recognise in the tree.
+
+[source,toml]
+----
+# protocols/quiet-channel.toml  — the shipped toy protocol (rule 11 demo)
+schema_version = "0.1.0"
+id             = "quiet-channel"
+description    = "A channel that must not emit while suppressed."
+channel        = "stdout"          # human label for the abstract resource
+
+states = ["open", "suppressed"]
+initial = "open"
+
+# A transition fires when a call matching `on` is seen on a reachable path.
+# `on` is matched structurally against call nodes (see "Call matching").
+[[transition]]
+on   = "set_quiet"                 # bare name or dotted: "logger.set_quiet"
+from = "open"
+to   = "suppressed"
+
+[[transition]]
+on   = "set_loud"                  # the un-suppress
+from = "suppressed"
+to   = "open"
+
+# An `emit` is an operation that is ILLEGAL in the listed `forbidden_in` states.
+[[operation]]
+on           = "prompt"
+kind         = "emit"
+forbidden_in = ["suppressed"]
+message      = "prompt() emits on a channel that was put in a suppressed state"
+----
+
+`resource-acquired-not-released` (rule 12) is the *same schema* with a different
+machine (`states = ["released","acquired"]`, `acquire`→`acquired`,
+`release`→`released`) plus a *terminal obligation*:
+
+[source,toml]
+----
+# a state the function must NOT be in at exit
+must_exit_in = ["released"]
+----
+
+== Call matching (how `on` binds to the tree)
+
+`on` is a *matcher string*, not a value. Matching is deliberately shallow
+(syntactic), because a precise "is this the same object?" analysis is
+interprocedural and out of scope. v0.1.0 matching rules, in order:
+
+. *Bare name* `"set_quiet"` matches a call whose callee is either the identifier
+  `set_quiet(...)` or an attribute call `<anything>.set_quiet(...)`. The
+  *receiver* (the `<anything>`) is captured as the channel *instance key* — a
+  best-effort syntactic key (the receiver's source text, e.g. `self.log`,
+  `logger`). Calls with different instance keys are *different channels* and
+  tracked independently.
+. *Dotted* `"logger.set_quiet"` matches only when the receiver text equals
+  `logger`. Use this to pin a specific object.
+. No wildcards, no argument matching in v0.1.0. (Noted for later: an `args`
+  predicate.)
+
+*Instance-key caveat (documented limitation):* the key is syntactic. `a.set_quiet()`
+then `b.prompt()` are treated as different channels even if `a is b` at runtime;
+`get().set_quiet()` then `get().prompt()` are treated as different channels even
+if they are the same object. This yields *false negatives* (missed bugs), never
+false positives — the honest direction for a T2 with no alias analysis. State
+this in the report footer and the catalogue entry.
+
+== Typestate semantics (the walk)
+
+A forward, per-path *may*-analysis over the ADR-0002 CFG, one instance key at a
+time. Domain: for each live instance key, the *set of states it may be in* at a
+program point (a set, because different paths reach a join in different states).
+
+[source,text]
+----
+State_in(entry)[k] = { initial }                         for every instance key k
+State_in(B)[k]     = ⋃ { State_out(P)[k] : P ∈ pred(B) } (union over predecessors)
+State_out(B)[k]    = fold transitions of B over State_in(B)[k]
+
+transition (on=call m, from=F, to=T) applied to a matched call on key k:
+    S' := (S \ {F}) ∪ ({T} if F ∈ S else ∅)
+    # states not mentioned as `from` pass through unchanged (partial function)
+    # concretely: for each s in S: if a transition (s --m--> t) exists, replace
+    #   s by t; else keep s.
+----
+
+*Firing condition — `suppress-then-emit` / any `operation kind=emit`.* At a call
+matching an operation `op` with `forbidden_in = Fs` on instance key `k`, if
+`State_in(point)[k] ∩ Fs ≠ ∅` — i.e. on *some reachable path* the channel may be
+in a forbidden state — emit a finding. Location = the emit call. Evidence class
+= `PROTOCOL`. Severity = `WARN` (a contradiction, but the alias caveat means we
+are honest that it is path-possible, not certain).
+
+*Firing condition — `must_exit_in` (rule 12).* At the function `exit` block, for
+each instance key `k` that was ever moved out of `initial`, if
+`State_in(exit)[k] ⊄ must_exit_in` (some path leaves it in a non-terminal
+state), emit "resource acquired on some path but not released before return".
+
+*Loops.* The union-at-join formulation reaches a fixpoint over the finite
+state-set powerset; the back-edge simply feeds `State_out(body-tail)` into the
+header's `State_in`. No unrolling. A channel suppressed inside a loop and emitted
+after is caught because the header join carries `{suppressed}` from the back-edge.
+
+*Reset across un-suppress.* Because `set_loud` transitions `suppressed → open`,
+an emit *after* a dominating un-suppress sees `State_in ∩ forbidden = ∅` → no
+finding. This is the required negative-corpus behaviour (rule fires on
+suppress-then-emit but NOT on suppress-then-unsuppress-then-emit).
+
+== The evidence-note text (required, per finding)
+
+Every T2 finding's `evidence_note` states the *path witness* in words:
+"channel `<key>` enters state `suppressed` at line A (`set_quiet`) and reaches
+`prompt` at line B with no `set_loud` on the path between them." The walker must
+retain, per fired finding, at least one witnessing predecessor chain to fill
+this in (store the CFG point where the forbidding transition last fired). A T2
+finding a human cannot trace to two concrete lines is not shippable.
+
+== Counter-condition / caveat (printed with every T2 finding)
+
+Fixed footer text on T2 findings: "typestate over a *syntactic* channel key; no
+alias analysis — a supplied protocol is required and cross-object aliasing is
+not tracked (may miss real bugs, does not invent them)." This is the
+counter_condition field for rule 11/12.
+
+== What ships in v0.1.0
+
+* `pons-protocols/protocols/quiet-channel.toml` (the toy protocol above) —
+  loaded by default when `--tier` includes 2 and no `--protocol` is given, *with
+  a stderr note* that it is a demonstration protocol.
+* `--protocol <file>` overrides / adds user protocols.
+* Rule 11 `suppress-then-emit` end-to-end against the toy protocol with positive
+  + negative corpora (the negative corpus's centrepiece is the
+  suppress→unsuppress→emit case).
+* Rule 12 `resource-acquired-not-released` is *optional* for v0.1.0 (kickoff):
+  include only if the walker lands with time to spare. Its `must_exit_in`
+  machinery is specified here so it is a small addition, not a redesign.
+
+== Test obligations specific to T2
+
+* Positive corpus: linear suppress-then-emit; suppress in one `if` branch, emit
+  after the join (path-possible); suppress inside a loop, emit after.
+* Negative corpus: suppress→unsuppress→emit; emit before any suppress; emit on a
+  *different* instance key; emit guarded by an `if not quiet:` that the walker is
+  NOT required to understand — this last one is the honest false-positive the
+  caveat covers, so it is documented as a *known* limitation and, to keep the
+  gate green, is EXCLUDED from the negative corpus with a comment pointing here.
+  (We do not put cases the design admits it cannot handle into the falsifier
+  gate; we document them instead. This distinction — "limitation, disclosed" vs
+  "falsifier, gated" — is itself part of the epistemic-honesty contract.)

@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+= pons — Owner decisions (the only things NOT bulldozed)
+:toc: preamble
+
+The plan deliberately resolves every *technical* design question so
+implementation agents never stall. The following are genuinely the owner's to
+call — they are matters of naming, licence, and estate placement, not
+engineering. None of them block starting implementation (M0–M4 proceed under the
+recorded defaults); they want ratifying before *v0.1.0 tag*.
+
+*Ratified 2026-07-08 by owner:* D1 name = `pons` (kept); D2 licence = `MPL-2.0`
+code / `CC-BY-SA-4.0` docs; D3 repository = *public*, independent top-level repo;
+author = Jonathan D.A. Jewell. D4 (estate CI template) remains open; D5 (Python
+as T1 language) stands as an engineering decision. The original text is kept
+below for the record.
+
+== D1 — Name
+
+Working name `pons` (pons asinorum). Nothing in the code depends on the string
+(kickoff §working-name). Default: keep `pons`. Alternatives the owner might
+prefer signal the panic-attack sibling relationship (ADR-0004). *Decision:
+keep `pons` or supply a replacement before tag.*
+
+== D2 — Licence
+
+Default taken: `MPL-2.0`, copied from panic-attack house style (ADR-0004). The
+estate has recently moved some tools to AGPL (e.g. echidna, per session memory).
+*Decision: confirm `MPL-2.0`, or set `AGPL-3.0` / other before the SPDX headers
+proliferate.* Changing later is a header sweep — cheap now, tedious at M8.
+
+== D3 — Repository visibility + placement
+
+Created *private* by default (estate habit for new, unratified repos — cf.
+`marches`). *Decision: keep private, or flip public.* Also: pons is an
+independent top-level repo (ADR-0004), sibling to panic-attack — confirm that
+placement rather than nesting it under panic-attack or the hospital model.
+
+== D4 — Estate CI / template adoption
+
+pons currently ships a minimal CI skeleton (fmt + clippy + test + the falsifier
+gate). The estate has an RSR template family with standard gates (Secret
+Scanner, Scorecard, governance, static-analysis-gate). *Decision: adopt the RSR
+Rust template now, or defer estate-CI onboarding until after v0.1.0?* Recommend
+deferring the heavy template until the catalogue exists, keeping only the
+falsifier gate as required — but this is an estate-consistency call.
+
+== D5 — T1 language confirmation (informational, already decided)
+
+ADR-0002 chose *Python* as the T1 language with a full rationale (Rust's `Drop`
+side effects need type resolution / a build, inflating false positives; Python's
+function-scope + no-default-init make the two T1 rules clean). This is an
+*engineering* decision and is treated as settled — listed here only so the owner
+sees it, since "prefer Rust" is house style and this is a deliberate exception
+for the *analysed* language (the engine stays Rust). Override only if you
+specifically want Rust-as-analysed-target in v0.1.0 (accepting the higher
+false-positive surface).
+
+== Everything else
+
+...is in the kickoff + ADRs 0001–0004 + PLAN and is not an owner decision. If
+something there feels like it needs a ruling, it is probably already ruled —
+check the named ADR before escalating.
